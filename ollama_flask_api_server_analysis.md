@@ -109,3 +109,63 @@ X-Admin-API-Key: your-strong-key
 
 若金鑰錯誤：
 - `401 ADMIN_UNAUTHORIZED`
+
+## 五、常見錯誤：`ADMIN_API_KEY_NOT_CONFIGURED` 排查與設定
+
+若前端看到：
+
+- `錯誤：無法取得段落資料（HTTP 500 / ADMIN_API_KEY_NOT_CONFIGURED）：伺服器尚未設定管理 API 金鑰`
+
+這是**後端 API 服務設定問題**（不是前端參數格式問題）。
+
+### 原因
+
+`/admin/*` 端點在進入業務邏輯前，會先檢查後端程序的環境變數 `ADMIN_API_KEY`。
+
+- 沒有設定：回傳 `500 ADMIN_API_KEY_NOT_CONFIGURED`
+- 有設定但請求 Header 不符：回傳 `401 ADMIN_UNAUTHORIZED`
+
+### 設定方式（Linux/macOS）
+
+#### 1) 先在啟動同一個 shell 設定環境變數
+
+```bash
+export ADMIN_API_KEY='replace-with-a-strong-secret'
+python ollama_flask_api_server.py
+```
+
+#### 2) 呼叫管理端點時帶上 Header
+
+```bash
+curl -H "X-Admin-API-Key: $ADMIN_API_KEY" http://127.0.0.1:5000/admin/list
+```
+
+### 如果你用 systemd 啟動
+
+在 service 檔加入：
+
+```ini
+Environment="ADMIN_API_KEY=replace-with-a-strong-secret"
+```
+
+變更後執行：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart <your-service-name>
+```
+
+### 如果你用 Docker 啟動
+
+```bash
+docker run -e ADMIN_API_KEY='replace-with-a-strong-secret' -p 5000:5000 <image>
+```
+
+### 最快自我檢查
+
+```bash
+echo "$ADMIN_API_KEY"
+```
+
+- 空值表示目前 shell/程序沒有拿到 key。
+- 注意：若你是在 A terminal 設定 `export`，卻在 B terminal 啟動服務，B terminal 不會自動有該變數。
