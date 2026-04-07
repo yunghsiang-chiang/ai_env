@@ -2,6 +2,7 @@ import time
 import threading
 import psutil
 import os
+from functools import wraps
 from flask import Flask, request, jsonify
 import faiss
 import numpy as np
@@ -9,41 +10,85 @@ from sentence_transformers import SentenceTransformer
 import ollama
 import json
 import sqlite3
-import os
 
 
 # ------------------ 參數設定 ------------------
-MAX_QUESTION_LEN = 300           # 問句長度上限 (字元)
-CPU_THRESHOLD    = 90.0          # CPU 過載門檻 (%)
-MEM_THRESHOLD    = 90.0          # RAM 過載門檻 (%)
-PORT             = 5000          # Flask 服務埠
-TOP_K_DEFAULT    = 5             # 預設檢索段落數
-MAX_TOP_K        = 10             # 允許的最大檢索段落數
-MODEL_NAME       = "llama3"      # Ollama 模型
+MAX_QUESTION_LEN = 300            # 問句長度上限 (字元)
+CPU_THRESHOLD = 90.0              # CPU 過載門檻 (%)
+MEM_THRESHOLD = 90.0              # RAM 過載門檻 (%)
+PORT = 5000                       # Flask 服務埠
+TOP_K_DEFAULT = 5                 # 預設檢索段落數
+MAX_TOP_K = 10                    # 允許的最大檢索段落數
+MODEL_NAME = "llama3"             # Ollama 模型
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
+ADMIN_API_KEY_HEADER = "X-Admin-API-Key"
+
+
+class RWLock:
+    """簡易讀寫鎖：允許多讀者，寫入獨佔。"""
+
+    def __init__(self):
+        self._cond = threading.Condition(threading.Lock())
+        self._readers = 0
+        self._writer = False
+
+    def acquire_read(self):
+        with self._cond:
+            while self._writer:
+                self._cond.wait()
+            self._readers += 1
+
+    def release_read(self):
+        with self._cond:
+            self._readers -= 1
+            if self._readers == 0:
+                self._cond.notify_all()
+
+    def acquire_write(self):
+        with self._cond:
+            while self._writer or self._readers > 0:
+                self._cond.wait()
+            self._writer = True
+
+    def release_write(self):
+        with self._cond:
+            self._writer = False
+            self._cond.notify_all()
+
 
 # ------------------ 全域載入 ------------------
 app = Flask(__name__)
-lock = threading.Lock()           # 單一推論鎖
+rw_lock = RWLock()  # 查詢與管理操作共用同一把讀寫鎖
 
 embedding_model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
-index      = faiss.read_index("faiss_index.bin")
+index = faiss.read_index("faiss_index.bin")
 paragraphs = np.load("paragraphs.npy", allow_pickle=True)
 
+
 # 套用 modifications.json（如有）
-mod_file = "modifications.json"
-if os.path.exists(mod_file):
-    try:
-        with open(mod_file, "r", encoding="utf-8") as f:
-            mods = json.load(f)
-        for pid_str, new_text in mods.items():
-            pid = int(pid_str)
-            if 0 <= pid < len(paragraphs):
-                paragraphs[pid] = new_text
-        # 套用後刪除 modifications.json
-        os.remove(mod_file)
+def apply_pending_modifications(paragraph_array):
+    mod_file = "modifications.json"
+    if not os.path.exists(mod_file):
+        return paragraph_array, False
+
+    with open(mod_file, "r", encoding="utf-8") as f:
+        mods = json.load(f)
+
+    for pid_str, new_text in mods.items():
+        pid = int(pid_str)
+        if 0 <= pid < len(paragraph_array):
+            paragraph_array[pid] = new_text
+
+    os.remove(mod_file)
+    return paragraph_array, True
+
+
+try:
+    paragraphs, applied = apply_pending_modifications(paragraphs)
+    if applied:
         print("[INFO] Modifications applied from modifications.json")
-    except Exception as e:
-        print("[WARN] Failed to apply modifications.json:", str(e))
+except Exception as e:
+    print("[WARN] Failed to apply modifications.json:", str(e))
 
 
 # ------------------ 熱載模型 ------------------
@@ -53,19 +98,46 @@ try:
 except Exception as exc:
     print("[WARN] Warm-up ping failed:", exc)
 
+
 # ------------------ 工具函式 ------------------
+def error_response(code: str, message: str, status: int, details=None):
+    payload = {
+        "code": code,
+        "message": message,
+        "details": details,
+    }
+    return jsonify(payload), status
+
+
+def normalize_top_k(raw_top_k, total_paragraphs: int) -> int:
+    if total_paragraphs <= 0:
+        return 0
+
+    try:
+        parsed = int(raw_top_k)
+    except (TypeError, ValueError):
+        parsed = TOP_K_DEFAULT
+
+    if parsed <= 0:
+        parsed = TOP_K_DEFAULT
+
+    return max(1, min(parsed, MAX_TOP_K, total_paragraphs))
+
+
 def compute_embeddings(texts):
     return embedding_model.encode(texts, convert_to_numpy=True)
+
 
 def retrieve_similar_texts(query, top_k: int = TOP_K_DEFAULT):
     total_paragraphs = len(paragraphs)
     if total_paragraphs == 0:
-        return []
+        return [], 0
 
-    top_k = max(1, min(top_k, MAX_TOP_K, total_paragraphs))
+    actual_top_k = max(1, min(top_k, MAX_TOP_K, total_paragraphs))
     query_emb = compute_embeddings([query])
-    _, idxs = index.search(query_emb, top_k)
-    return [paragraphs[i] for i in idxs[0]]
+    _, idxs = index.search(query_emb, actual_top_k)
+    return [paragraphs[i] for i in idxs[0]], actual_top_k
+
 
 def query_llm(question: str, retrieved_text: str) -> str:
     prompt = (
@@ -76,14 +148,42 @@ def query_llm(question: str, retrieved_text: str) -> str:
     resp = ollama.chat(model=MODEL_NAME, messages=[{"role": "user", "content": prompt}])
     return resp["message"]["content"].strip()
 
+
 def system_overloaded() -> bool:
     return (
         psutil.cpu_percent(interval=0.1) > CPU_THRESHOLD or
         psutil.virtual_memory().percent > MEM_THRESHOLD
     )
 
+
+def require_admin_api_key(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if not ADMIN_API_KEY:
+            return error_response(
+                "ADMIN_API_KEY_NOT_CONFIGURED",
+                "伺服器尚未設定管理 API 金鑰",
+                500,
+                {"required_env": "ADMIN_API_KEY", "header": ADMIN_API_KEY_HEADER},
+            )
+
+        incoming_key = request.headers.get(ADMIN_API_KEY_HEADER, "")
+        if incoming_key != ADMIN_API_KEY:
+            return error_response(
+                "ADMIN_UNAUTHORIZED",
+                "管理 API 驗證失敗",
+                401,
+                {"header": ADMIN_API_KEY_HEADER},
+            )
+
+        return func(*args, **kwargs)
+
+    return wrapper
+
+
 # ------------------ 路由 ------------------
 @app.route('/admin/source-files', methods=['GET'])
+@require_admin_api_key
 def list_source_files():
     try:
         files = [f for f in os.listdir("after") if f.endswith(".txt")]
@@ -93,7 +193,8 @@ def list_source_files():
             "files": files
         })
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return error_response("INTERNAL_ERROR", "讀取來源檔案失敗", 500, str(e))
+
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -103,56 +204,51 @@ def health():
         "mem": psutil.virtual_memory().percent
     })
 
+
 @app.route('/ask', methods=['POST'])
 def ask():
-    data = request.get_json()
-    print("[DEBUG] data from POST /ask:", data)
-    
     start_ts = time.time()
 
     if system_overloaded():
-        return jsonify({"error": "系統負載過高，請稍後重試"}), 503
+        return error_response("SYSTEM_OVERLOADED", "系統負載過高，請稍後重試", 503)
 
-    if not lock.acquire(blocking=False):
-        return jsonify({"error": "伺服器忙碌中，請稍後重試"}), 503
-
+    rw_lock.acquire_read()
     try:
         data = request.get_json(silent=True) or {}
         question = str(data.get("question", "")).strip()
         if not question:
-            return jsonify({"error": "請提供 question 參數"}), 400
+            return error_response("BAD_REQUEST", "請提供 question 參數", 400)
         if len(question) > MAX_QUESTION_LEN:
-            return jsonify({"error": f"問題長度超過 {MAX_QUESTION_LEN} 字元"}), 400
+            return error_response("QUESTION_TOO_LONG", f"問題長度超過 {MAX_QUESTION_LEN} 字元", 400)
 
-        try:
-            user_top_k = int(data.get("top_k", MAX_TOP_K))
-        except (TypeError, ValueError):
-            user_top_k = MAX_TOP_K
-
-        context = "\n".join(retrieve_similar_texts(question, top_k=user_top_k)).strip()
-        answer  = query_llm(question, context)
+        user_top_k = data.get("top_k", TOP_K_DEFAULT)
+        actual_top_k = normalize_top_k(user_top_k, len(paragraphs))
+        context_list, actual_top_k = retrieve_similar_texts(question, top_k=actual_top_k)
+        context = "\n".join(context_list).strip()
+        answer = query_llm(question, context)
 
         return jsonify({
             "question": question,
             "context": context,
             "answer": answer,
+            "top_k": actual_top_k,
             "elapsed_sec": round(time.time() - start_ts, 2)
         })
 
     except Exception as exc:
-        return jsonify({"error": f"內部錯誤：{exc}"}), 500
-
+        return error_response("INTERNAL_ERROR", "內部錯誤", 500, str(exc))
     finally:
-        lock.release()
+        rw_lock.release_read()
+
 
 @app.route('/admin/list', methods=['GET'])
+@require_admin_api_key
 def list_paragraphs():
+    rw_lock.acquire_read()
     try:
-        # 預設值
         page = int(request.args.get('page', 1))
         page_size = int(request.args.get('pageSize', 100))
 
-        # 邊界控制
         if page < 1:
             page = 1
         if page_size < 1:
@@ -178,24 +274,31 @@ def list_paragraphs():
                 i: paragraphs[i] for i in range(start, end)
             }
         }
-
         return jsonify(result)
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return error_response("INTERNAL_ERROR", "查詢段落失敗", 500, str(e))
+    finally:
+        rw_lock.release_read()
 
 
 @app.route('/admin/delete/<int:pid>', methods=['DELETE'])
+@require_admin_api_key
 def delete_paragraph(pid):
     global paragraphs, index
+
+    rw_lock.acquire_write()
     try:
         if pid < 0 or pid >= len(paragraphs):
-            return jsonify({"error": "段落 ID 不存在"}), 404
+            return error_response("NOT_FOUND", "段落 ID 不存在", 404, {"pid": pid})
 
         paragraphs = np.delete(paragraphs, pid)
-        embeddings = embedding_model.encode(paragraphs.tolist(), convert_to_numpy=True)
-        index = faiss.IndexFlatL2(embeddings.shape[1])
-        index.add(embeddings)
+        if len(paragraphs) > 0:
+            embeddings = embedding_model.encode(paragraphs.tolist(), convert_to_numpy=True)
+            index = faiss.IndexFlatL2(embeddings.shape[1])
+            index.add(embeddings)
+        else:
+            index = faiss.IndexFlatL2(384)
 
         np.save("paragraphs.npy", paragraphs)
         faiss.write_index(index, "faiss_index.bin")
@@ -203,35 +306,39 @@ def delete_paragraph(pid):
         return jsonify({"status": "deleted", "id": pid})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    
-# 1. 修改段落內容，寫入修改紀錄檔
+        return error_response("INTERNAL_ERROR", "刪除段落失敗", 500, str(e))
+    finally:
+        rw_lock.release_write()
+
+
 @app.route('/admin/update/<int:pid>', methods=['PUT'])
+@require_admin_api_key
 def update_paragraph(pid):
+    rw_lock.acquire_write()
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True) or {}
         new_text = str(data.get("text", "")).strip()
         if not new_text:
-            return jsonify({"error": "請提供 text 欄位"}), 400
+            return error_response("BAD_REQUEST", "請提供 text 欄位", 400)
 
         if pid < 0 or pid >= len(paragraphs):
-            return jsonify({"error": "段落 ID 不存在"}), 404
+            return error_response("NOT_FOUND", "段落 ID 不存在", 404, {"pid": pid})
 
-        # 備份舊內容
         old_text = str(paragraphs[pid])
-        new_text = data.get("text", "").strip()
-        
+
         db_path = os.path.join("db", "modification_log.db")
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-        cursor.execute("""
+        cursor.execute(
+            """
             INSERT INTO modification_logs (pid, old_text, new_text)
             VALUES (?, ?, ?)
-        """, (pid, old_text, new_text))
+            """,
+            (pid, old_text, new_text),
+        )
         conn.commit()
         conn.close()
 
-        # 寫入修改紀錄
         mod_file = "modifications.json"
         try:
             if os.path.exists(mod_file):
@@ -239,7 +346,7 @@ def update_paragraph(pid):
                     mods = json.load(f)
             else:
                 mods = {}
-        except:
+        except Exception:
             mods = {}
 
         mods[str(pid)] = new_text
@@ -249,12 +356,15 @@ def update_paragraph(pid):
         return jsonify({"status": "saved", "id": pid, "message": "修改已儲存，重新啟動後生效"})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return error_response("INTERNAL_ERROR", "更新段落失敗", 500, str(e))
+    finally:
+        rw_lock.release_write()
 
 
-# 2. 查詢等待修改的段落（modifications.json）
 @app.route('/admin/pending-modifications', methods=['GET'])
+@require_admin_api_key
 def get_pending_modifications():
+    rw_lock.acquire_read()
     try:
         mod_file = "modifications.json"
         if not os.path.exists(mod_file):
@@ -265,45 +375,43 @@ def get_pending_modifications():
         return jsonify({"pending": mods})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return error_response("INTERNAL_ERROR", "讀取 pending modifications 失敗", 500, str(e))
+    finally:
+        rw_lock.release_read()
 
 
-# 3. 是否有等待更新的資料
 @app.route('/admin/reload-needed', methods=['GET'])
+@require_admin_api_key
 def is_reload_needed():
     return jsonify({"reload_needed": os.path.exists("modifications.json")})
 
-# 重新載入 paragraphs.npy、重新套用 modifications.json（如存在）、重新建構 embedding 並更新 FAISS index、移除 modifications.json，避免重複套用
+
 @app.route('/admin/reload', methods=['POST'])
+@require_admin_api_key
 def reload_data():
     global paragraphs, index
 
+    rw_lock.acquire_write()
     try:
-        # 1. 重新讀取原始資料
         paragraphs = np.load("paragraphs.npy", allow_pickle=True)
-
-        # 2. 套用修改
-        mod_file = "modifications.json"
-        if os.path.exists(mod_file):
-            with open(mod_file, "r", encoding="utf-8") as f:
-                mods = json.load(f)
-            for pid_str, new_text in mods.items():
-                pid = int(pid_str)
-                if 0 <= pid < len(paragraphs):
-                    paragraphs[pid] = new_text
-            os.remove(mod_file)
+        paragraphs, applied = apply_pending_modifications(paragraphs)
+        if applied:
             print("[INFO] Modifications applied and file removed.")
 
-        # 3. 重新計算 embeddings 並建立 FAISS index
-        embeddings = embedding_model.encode(paragraphs.tolist(), convert_to_numpy=True)
-        index = faiss.IndexFlatL2(embeddings.shape[1])
-        index.add(embeddings)
+        if len(paragraphs) > 0:
+            embeddings = embedding_model.encode(paragraphs.tolist(), convert_to_numpy=True)
+            index = faiss.IndexFlatL2(embeddings.shape[1])
+            index.add(embeddings)
+        else:
+            index = faiss.IndexFlatL2(384)
         print("[INFO] FAISS index rebuilt.")
 
         return jsonify({"status": "reloaded", "paragraphs_count": len(paragraphs)})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return error_response("INTERNAL_ERROR", "重新載入資料失敗", 500, str(e))
+    finally:
+        rw_lock.release_write()
 
 
 # ------------------ 主程式 ------------------
