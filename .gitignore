@@ -1,0 +1,34 @@
+# sensitive
+*.identitier
+.identitier
+*.json
+*.pem
+*.key
+
+# python venv
+bin/
+include/
+lib/
+lib64/
+pyvenv.cfg
+.venv/
+venv/
+env/
+
+# caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.cache/
+.ipynb_checkpoints/
+
+# large local artifacts
+pytorch/
+*.npy
+*.bin
+faiss_index.bin
+
+# system
+.DS_Store
+Thumbs.db
