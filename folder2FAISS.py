@@ -104,9 +104,10 @@ def read_docx_file(filepath: Path) -> list[str]:
     return paragraphs
 
 
-def collect_paragraphs(source_dir: str) -> list[str]:
+def collect_paragraphs(source_dir: str) -> tuple[list[str], list[str]]:
     base = Path(source_dir)
     collected: list[str] = []
+    source_files: list[str] = []
 
     if not base.exists():
         raise FileNotFoundError(f"資料夾不存在：{base.resolve()}")
@@ -120,21 +121,27 @@ def collect_paragraphs(source_dir: str) -> list[str]:
             if suffix == ".txt":
                 content = try_open_text_file(file_path)
                 if content:
-                    collected.extend(split_into_paragraphs(content))
+                    file_paragraphs = split_into_paragraphs(content)
+                    collected.extend(file_paragraphs)
+                    source_files.extend([file_path.name] * len(file_paragraphs))
             elif suffix in {".xlsx", ".xls"}:
-                collected.extend(read_excel_file(file_path))
+                file_paragraphs = read_excel_file(file_path)
+                collected.extend(file_paragraphs)
+                source_files.extend([file_path.name] * len(file_paragraphs))
             elif suffix == ".docx":
-                collected.extend(read_docx_file(file_path))
+                file_paragraphs = read_docx_file(file_path)
+                collected.extend(file_paragraphs)
+                source_files.extend([file_path.name] * len(file_paragraphs))
         except Exception as exc:
             print(f"[WARN] 略過檔案 {file_path.name}，原因：{exc}")
 
-    return collected
+    return collected, source_files
 
 
 # ------------------ 建立向量索引 ------------------
 
 def main():
-    paragraphs = collect_paragraphs(SOURCE_DIR)
+    paragraphs, paragraph_sources = collect_paragraphs(SOURCE_DIR)
     print(f"總共取得段落數：{len(paragraphs)}")
 
     if not paragraphs:
@@ -148,8 +155,9 @@ def main():
 
     faiss.write_index(index, "faiss_index.bin")
     np.save("paragraphs.npy", np.array(paragraphs, dtype=object))
+    np.save("paragraph_sources.npy", np.array(paragraph_sources, dtype=object))
 
-    print("已儲存 FAISS 索引與段落內容。")
+    print("已儲存 FAISS 索引、段落內容與來源檔名。")
 
 
 if __name__ == "__main__":
