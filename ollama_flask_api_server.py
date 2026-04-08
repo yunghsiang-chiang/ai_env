@@ -63,6 +63,10 @@ rw_lock = RWLock()  # 查詢與管理操作共用同一把讀寫鎖
 embedding_model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
 index = faiss.read_index("faiss_index.bin")
 paragraphs = np.load("paragraphs.npy", allow_pickle=True)
+if os.path.exists("paragraph_sources.npy"):
+    paragraph_sources = np.load("paragraph_sources.npy", allow_pickle=True)
+else:
+    paragraph_sources = np.array(["unknown"] * len(paragraphs), dtype=object)
 
 
 # 套用 modifications.json（如有）
@@ -128,6 +132,21 @@ def compute_embeddings(texts):
     return embedding_model.encode(texts, convert_to_numpy=True)
 
 
+def ensure_sources_length_match():
+    global paragraph_sources
+    if len(paragraph_sources) == len(paragraphs):
+        return
+
+    normalized = np.array(["unknown"] * len(paragraphs), dtype=object)
+    copy_len = min(len(paragraph_sources), len(paragraphs))
+    if copy_len > 0:
+        normalized[:copy_len] = paragraph_sources[:copy_len]
+    paragraph_sources = normalized
+
+
+ensure_sources_length_match()
+
+
 def retrieve_similar_texts(query, top_k: int = TOP_K_DEFAULT):
     total_paragraphs = len(paragraphs)
     if total_paragraphs == 0:
@@ -136,7 +155,17 @@ def retrieve_similar_texts(query, top_k: int = TOP_K_DEFAULT):
     actual_top_k = max(1, min(top_k, MAX_TOP_K, total_paragraphs))
     query_emb = compute_embeddings([query])
     _, idxs = index.search(query_emb, actual_top_k)
-    return [paragraphs[i] for i in idxs[0]], actual_top_k
+    result = []
+    for pid in idxs[0]:
+        source_file = "unknown"
+        if 0 <= pid < len(paragraph_sources):
+            source_file = str(paragraph_sources[pid])
+        result.append({
+            "pid": int(pid),
+            "text": str(paragraphs[pid]),
+            "source_file": source_file
+        })
+    return result, actual_top_k
 
 
 def query_llm(question: str, retrieved_text: str) -> str:
@@ -205,6 +234,36 @@ def health():
     })
 
 
+@app.route('/paragraphs-by-file', methods=['GET'])
+def get_paragraphs_by_file():
+    rw_lock.acquire_read()
+    try:
+        file_name = str(request.args.get("file_name", "")).strip()
+        if not file_name:
+            return error_response("BAD_REQUEST", "請提供 file_name 參數", 400)
+
+        matched = []
+        for i, text in enumerate(paragraphs):
+            source_file = str(paragraph_sources[i]) if i < len(paragraph_sources) else "unknown"
+            if source_file == file_name:
+                matched.append({
+                    "pid": i,
+                    "text": str(text),
+                    "source_file": source_file
+                })
+
+        return jsonify({
+            "file_name": file_name,
+            "count": len(matched),
+            "paragraphs": matched
+        })
+
+    except Exception as e:
+        return error_response("INTERNAL_ERROR", "依檔案查詢段落失敗", 500, str(e))
+    finally:
+        rw_lock.release_read()
+
+
 @app.route('/ask', methods=['POST'])
 def ask():
     start_ts = time.time()
@@ -223,13 +282,14 @@ def ask():
 
         user_top_k = data.get("top_k", TOP_K_DEFAULT)
         actual_top_k = normalize_top_k(user_top_k, len(paragraphs))
-        context_list, actual_top_k = retrieve_similar_texts(question, top_k=actual_top_k)
-        context = "\n".join(context_list).strip()
+        context_items, actual_top_k = retrieve_similar_texts(question, top_k=actual_top_k)
+        context = "\n".join(item["text"] for item in context_items).strip()
         answer = query_llm(question, context)
 
         return jsonify({
             "question": question,
             "context": context,
+            "context_items": context_items,
             "answer": answer,
             "top_k": actual_top_k,
             "elapsed_sec": round(time.time() - start_ts, 2)
@@ -270,9 +330,14 @@ def list_paragraphs():
             "page": page,
             "pageSize": page_size,
             "total": total,
-            "paragraphs": {
-                i: paragraphs[i] for i in range(start, end)
-            }
+            "paragraphs": [
+                {
+                    "pid": i,
+                    "text": str(paragraphs[i]),
+                    "source_file": str(paragraph_sources[i]) if i < len(paragraph_sources) else "unknown",
+                }
+                for i in range(start, end)
+            ]
         }
         return jsonify(result)
 
@@ -285,7 +350,7 @@ def list_paragraphs():
 @app.route('/admin/delete/<int:pid>', methods=['DELETE'])
 @require_admin_api_key
 def delete_paragraph(pid):
-    global paragraphs, index
+    global paragraphs, paragraph_sources, index
 
     rw_lock.acquire_write()
     try:
@@ -293,6 +358,7 @@ def delete_paragraph(pid):
             return error_response("NOT_FOUND", "段落 ID 不存在", 404, {"pid": pid})
 
         paragraphs = np.delete(paragraphs, pid)
+        paragraph_sources = np.delete(paragraph_sources, pid)
         if len(paragraphs) > 0:
             embeddings = embedding_model.encode(paragraphs.tolist(), convert_to_numpy=True)
             index = faiss.IndexFlatL2(embeddings.shape[1])
@@ -301,6 +367,7 @@ def delete_paragraph(pid):
             index = faiss.IndexFlatL2(384)
 
         np.save("paragraphs.npy", paragraphs)
+        np.save("paragraph_sources.npy", paragraph_sources)
         faiss.write_index(index, "faiss_index.bin")
 
         return jsonify({"status": "deleted", "id": pid})
@@ -389,11 +456,16 @@ def is_reload_needed():
 @app.route('/admin/reload', methods=['POST'])
 @require_admin_api_key
 def reload_data():
-    global paragraphs, index
+    global paragraphs, paragraph_sources, index
 
     rw_lock.acquire_write()
     try:
         paragraphs = np.load("paragraphs.npy", allow_pickle=True)
+        if os.path.exists("paragraph_sources.npy"):
+            paragraph_sources = np.load("paragraph_sources.npy", allow_pickle=True)
+        else:
+            paragraph_sources = np.array(["unknown"] * len(paragraphs), dtype=object)
+        ensure_sources_length_match()
         paragraphs, applied = apply_pending_modifications(paragraphs)
         if applied:
             print("[INFO] Modifications applied and file removed.")
