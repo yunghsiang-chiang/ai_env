@@ -22,6 +22,7 @@ MAX_TOP_K = 30                    # 允許的最大檢索段落數
 MODEL_NAME = "llama3"             # Ollama 模型
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
 ADMIN_API_KEY_HEADER = "X-Admin-API-Key"
+SAMPLED_FILES_TRACKER = "sampled_files.json"
 
 
 class RWLock:
@@ -147,6 +148,27 @@ def ensure_sources_length_match():
 ensure_sources_length_match()
 
 
+def load_sampled_files_tracker() -> list[str]:
+    if not os.path.exists(SAMPLED_FILES_TRACKER):
+        return []
+    try:
+        with open(SAMPLED_FILES_TRACKER, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            return []
+        normalized = sorted({str(item).strip() for item in data if str(item).strip()})
+        return normalized
+    except Exception:
+        return []
+
+
+def save_sampled_files_tracker(items: list[str]) -> list[str]:
+    normalized = sorted({str(item).strip() for item in items if str(item).strip()})
+    with open(SAMPLED_FILES_TRACKER, "w", encoding="utf-8") as f:
+        json.dump(normalized, f, ensure_ascii=False, indent=2)
+    return normalized
+
+
 def retrieve_similar_texts(query, top_k: int = TOP_K_DEFAULT):
     total_paragraphs = len(paragraphs)
     if total_paragraphs == 0:
@@ -215,14 +237,100 @@ def require_admin_api_key(func):
 @require_admin_api_key
 def list_source_files():
     try:
-        files = [f for f in os.listdir("after") if f.endswith(".txt")]
+        files = []
+        for f in os.listdir("after"):
+            _, ext = os.path.splitext(f)
+            if ext.lower() in {".txt", ".xls", ".xlsx", ".docx"}:
+                files.append(f)
+        sampled = set(load_sampled_files_tracker())
+        files.sort()
         return jsonify({
             "folder": "after",
             "file_count": len(files),
-            "files": files
+            "sampled_count": len(sampled),
+            "files": [
+                {
+                    "file_name": name,
+                    "sampled": name in sampled
+                }
+                for name in files
+            ]
         })
     except Exception as e:
         return error_response("INTERNAL_ERROR", "讀取來源檔案失敗", 500, str(e))
+
+
+@app.route('/admin/sampled-files', methods=['GET'])
+@require_admin_api_key
+def list_sampled_files():
+    rw_lock.acquire_read()
+    try:
+        sampled = load_sampled_files_tracker()
+        return jsonify({
+            "tracker_file": SAMPLED_FILES_TRACKER,
+            "count": len(sampled),
+            "files": sampled,
+        })
+    except Exception as e:
+        return error_response("INTERNAL_ERROR", "讀取已取樣檔案清單失敗", 500, str(e))
+    finally:
+        rw_lock.release_read()
+
+
+@app.route('/admin/sampled-files', methods=['POST'])
+@require_admin_api_key
+def add_sampled_file():
+    rw_lock.acquire_write()
+    try:
+        data = request.get_json(silent=True) or {}
+        file_name = str(data.get("file_name", "")).strip()
+        if not file_name:
+            return error_response("BAD_REQUEST", "請提供 file_name 欄位", 400)
+
+        sampled = load_sampled_files_tracker()
+        already_exists = file_name in sampled
+        if not already_exists:
+            sampled.append(file_name)
+            sampled = save_sampled_files_tracker(sampled)
+
+        return jsonify({
+            "status": "ok",
+            "action": "add",
+            "file_name": file_name,
+            "already_exists": already_exists,
+            "count": len(sampled),
+        })
+    except Exception as e:
+        return error_response("INTERNAL_ERROR", "新增已取樣檔案失敗", 500, str(e))
+    finally:
+        rw_lock.release_write()
+
+
+@app.route('/admin/sampled-files/<path:file_name>', methods=['DELETE'])
+@require_admin_api_key
+def remove_sampled_file(file_name):
+    rw_lock.acquire_write()
+    try:
+        target = str(file_name).strip()
+        if not target:
+            return error_response("BAD_REQUEST", "請提供檔名", 400)
+
+        sampled = load_sampled_files_tracker()
+        if target not in sampled:
+            return error_response("NOT_FOUND", "檔案不在已取樣清單中", 404, {"file_name": target})
+
+        sampled = [name for name in sampled if name != target]
+        sampled = save_sampled_files_tracker(sampled)
+        return jsonify({
+            "status": "ok",
+            "action": "delete",
+            "file_name": target,
+            "count": len(sampled),
+        })
+    except Exception as e:
+        return error_response("INTERNAL_ERROR", "刪除已取樣檔案失敗", 500, str(e))
+    finally:
+        rw_lock.release_write()
 
 
 @app.route('/health', methods=['GET'])
