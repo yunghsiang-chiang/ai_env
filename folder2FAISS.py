@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import json
 
 import faiss
 import numpy as np
@@ -11,6 +12,7 @@ from sentence_transformers import SentenceTransformer
 
 SOURCE_DIR = "after"
 MIN_PARAGRAPH_LEN = 20
+SAMPLED_FILES_TRACKER = "sampled_files.json"
 
 
 # ------------------ 讀取各格式資料 ------------------
@@ -104,16 +106,37 @@ def read_docx_file(filepath: Path) -> list[str]:
     return paragraphs
 
 
-def collect_paragraphs(source_dir: str) -> tuple[list[str], list[str]]:
+def load_sampled_files(tracker_path: str) -> set[str]:
+    tracker = Path(tracker_path)
+    if not tracker.exists():
+        return set()
+    with open(tracker, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, list):
+        return {str(item).strip() for item in data if str(item).strip()}
+    return set()
+
+
+def save_sampled_files(tracker_path: str, sampled_files: set[str]) -> None:
+    with open(tracker_path, "w", encoding="utf-8") as f:
+        json.dump(sorted(sampled_files), f, ensure_ascii=False, indent=2)
+
+
+def collect_paragraphs(source_dir: str, sampled_files: set[str]) -> tuple[list[str], list[str], set[str]]:
     base = Path(source_dir)
     collected: list[str] = []
     source_files: list[str] = []
+    processed_files: set[str] = set()
 
     if not base.exists():
         raise FileNotFoundError(f"資料夾不存在：{base.resolve()}")
 
     for file_path in sorted(base.iterdir()):
         if not file_path.is_file():
+            continue
+
+        file_name = file_path.name
+        if file_name in sampled_files:
             continue
 
         suffix = file_path.suffix.lower()
@@ -123,41 +146,65 @@ def collect_paragraphs(source_dir: str) -> tuple[list[str], list[str]]:
                 if content:
                     file_paragraphs = split_into_paragraphs(content)
                     collected.extend(file_paragraphs)
-                    source_files.extend([file_path.name] * len(file_paragraphs))
+                    source_files.extend([file_name] * len(file_paragraphs))
+                processed_files.add(file_name)
             elif suffix in {".xlsx", ".xls"}:
                 file_paragraphs = read_excel_file(file_path)
                 collected.extend(file_paragraphs)
-                source_files.extend([file_path.name] * len(file_paragraphs))
+                source_files.extend([file_name] * len(file_paragraphs))
+                processed_files.add(file_name)
             elif suffix == ".docx":
                 file_paragraphs = read_docx_file(file_path)
                 collected.extend(file_paragraphs)
-                source_files.extend([file_path.name] * len(file_paragraphs))
+                source_files.extend([file_name] * len(file_paragraphs))
+                processed_files.add(file_name)
         except Exception as exc:
-            print(f"[WARN] 略過檔案 {file_path.name}，原因：{exc}")
+            print(f"[WARN] 略過檔案 {file_name}，原因：{exc}")
 
-    return collected, source_files
+    return collected, source_files, processed_files
 
 
 # ------------------ 建立向量索引 ------------------
 
 def main():
-    paragraphs, paragraph_sources = collect_paragraphs(SOURCE_DIR)
-    print(f"總共取得段落數：{len(paragraphs)}")
+    sampled_files = load_sampled_files(SAMPLED_FILES_TRACKER)
+    new_paragraphs, new_sources, processed_files = collect_paragraphs(SOURCE_DIR, sampled_files)
+    print(f"本次新增段落數：{len(new_paragraphs)}")
 
-    if not paragraphs:
-        raise ValueError("沒有可用段落，請確認 after/ 中的 .txt/.xls/.xlsx/.docx 內容。")
+    existing_paragraphs = np.array([], dtype=object)
+    existing_sources = np.array([], dtype=object)
+    if Path("paragraphs.npy").exists():
+        existing_paragraphs = np.load("paragraphs.npy", allow_pickle=True)
+    if Path("paragraph_sources.npy").exists():
+        existing_sources = np.load("paragraph_sources.npy", allow_pickle=True)
+    if len(existing_sources) != len(existing_paragraphs):
+        normalized = np.array(["unknown"] * len(existing_paragraphs), dtype=object)
+        copy_len = min(len(existing_sources), len(existing_paragraphs))
+        if copy_len > 0:
+            normalized[:copy_len] = existing_sources[:copy_len]
+        existing_sources = normalized
+
+    if len(new_paragraphs) == 0:
+        if processed_files:
+            save_sampled_files(SAMPLED_FILES_TRACKER, sampled_files.union(processed_files))
+        print("沒有可新增段落，保留原有 paragraphs.npy / faiss_index.bin。")
+        return
+
+    paragraphs = np.concatenate([existing_paragraphs, np.array(new_paragraphs, dtype=object)])
+    paragraph_sources = np.concatenate([existing_sources, np.array(new_sources, dtype=object)])
 
     model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-    embeddings = model.encode(paragraphs, convert_to_numpy=True)
+    embeddings = model.encode(paragraphs.tolist(), convert_to_numpy=True)
 
     index = faiss.IndexFlatL2(embeddings.shape[1])
     index.add(embeddings)
 
     faiss.write_index(index, "faiss_index.bin")
-    np.save("paragraphs.npy", np.array(paragraphs, dtype=object))
-    np.save("paragraph_sources.npy", np.array(paragraph_sources, dtype=object))
+    np.save("paragraphs.npy", paragraphs)
+    np.save("paragraph_sources.npy", paragraph_sources)
+    save_sampled_files(SAMPLED_FILES_TRACKER, sampled_files.union(processed_files))
 
-    print("已儲存 FAISS 索引、段落內容與來源檔名。")
+    print("已更新 FAISS 索引、段落內容、來源檔名與取樣檔案清單。")
 
 
 if __name__ == "__main__":
